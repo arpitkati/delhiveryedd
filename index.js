@@ -3,6 +3,13 @@ import fetch from "node-fetch";
 
 const app = express();
 
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  next();
+});
+
 const ORIGIN_PIN = process.env.ORIGIN_PIN;         // your pickup pin
 const MOT = process.env.MOT || "E";                // E or S
 const DELHIVERY_TOKEN = process.env.DELHIVERY_TOKEN;
