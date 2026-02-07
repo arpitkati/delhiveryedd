@@ -146,7 +146,7 @@ app.get("/edd", async (req, res) => {
       if (!ip || isPrivateIp(ip)) {
         return res.json({
           ok: false,
-          message: "Could not detect user location IP for pincode. Please enter pincode.",
+          message: "Please enter pincode.",
           debug: { ip: rawIp },
         });
       }
@@ -155,7 +155,7 @@ app.get("/edd", async (req, res) => {
       if (!pinFromIp) {
         return res.json({
           ok: false,
-          message: "Could not resolve pincode from IP. Please enter pincode.",
+          message: "Please enter pincode.",
           debug: { ip },
         });
       }
