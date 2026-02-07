@@ -3,6 +3,9 @@ import fetch from "node-fetch";
 
 const app = express();
 
+/* -----------------------------
+   Basic CORS
+----------------------------- */
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
@@ -10,47 +13,74 @@ app.use((req, res, next) => {
   next();
 });
 
-const ORIGIN_PIN = process.env.ORIGIN_PIN;
-const MOT = process.env.MOT || "E";
+/* -----------------------------
+   ENV Variables
+----------------------------- */
+const ORIGIN_PIN = process.env.ORIGIN_PIN; // Pickup pincode
+const MOT = process.env.MOT || "E"; // E or S
 const DELHIVERY_TOKEN = process.env.DELHIVERY_TOKEN;
 
-const IPINFO_TOKEN = process.env.IPINFO_TOKEN; // strongly recommended
+const IPINFO_TOKEN = process.env.IPINFO_TOKEN; // Recommended
 
+/* -----------------------------
+   IMPORTANT for Proxies
+----------------------------- */
 app.set("trust proxy", true);
 
+/* -----------------------------
+   Helpers
+----------------------------- */
 function formatDate(d) {
-  return d.toLocaleDateString("en-IN", { weekday: "short", day: "2-digit", month: "short" });
+  return d.toLocaleDateString("en-IN", {
+    weekday: "short",
+    day: "2-digit",
+    month: "short",
+  });
 }
 
 function isValidPin(pin) {
   return /^\d{6}$/.test(String(pin || "").trim());
 }
 
-/** ✅ Best-effort client IP */
+/* -----------------------------
+   ✅ Correct Client IP Detection
+   Priority:
+   1) x-real-ip
+   2) x-forwarded-for (first IP)
+   3) cf-connecting-ip
+   4) Express fallback
+----------------------------- */
 function getClientIp(req) {
-  const shopifyIp = req.headers["x-shopify-client-ip"];
-  if (shopifyIp) return String(shopifyIp).trim();
+  const realIp = req.headers["x-real-ip"];
+  if (realIp) return String(realIp).trim();
+
+  const xff = req.headers["x-forwarded-for"];
+  if (xff) {
+    return String(xff).split(",")[0].trim();
+  }
 
   const cf = req.headers["cf-connecting-ip"];
   if (cf) return String(cf).trim();
 
-  const xff = req.headers["x-forwarded-for"];
-  if (xff) return String(xff).split(",")[0].trim();
-
   return (req.ip || req.socket?.remoteAddress || "").toString().trim();
 }
 
+/* Normalize IPv6-wrapped IPv4 */
 function normalizeIp(ip) {
   if (!ip) return "";
   let s = String(ip).trim();
+
   if (s.startsWith("::ffff:")) s = s.replace("::ffff:", "");
   if (s.includes("%")) s = s.split("%")[0];
+
   return s;
 }
 
+/* Private/local IP check */
 function isPrivateIp(ip) {
   if (!ip) return true;
   const s = ip.trim();
+
   if (s === "127.0.0.1" || s === "::1") return true;
   if (s.startsWith("10.")) return true;
   if (s.startsWith("192.168.")) return true;
@@ -60,50 +90,65 @@ function isPrivateIp(ip) {
     const second = Number(parts[1]);
     if (second >= 16 && second <= 31) return true;
   }
+
   return false;
 }
 
-/** ✅ Safe fetch JSON (prevents r.json() crash if HTML/text comes back) */
+/* -----------------------------
+   Safe Fetch JSON (prevents crashes)
+----------------------------- */
 async function safeFetchJson(url, options = {}) {
   const r = await fetch(url, options);
   const text = await r.text();
 
-  let json = null;
   try {
-    json = JSON.parse(text);
+    return { ok: r.ok, json: JSON.parse(text) };
   } catch {
-    // not JSON
+    return { ok: false, json: null };
   }
-
-  return { ok: r.ok, status: r.status, json, text };
 }
 
+/* -----------------------------
+   IP → PINCODE Lookup
+----------------------------- */
 async function ipToPincode(ip) {
-  // Try ipinfo first if token available
+  // Best: ipinfo.io (token required)
   if (IPINFO_TOKEN) {
-    const url = `https://ipinfo.io/${encodeURIComponent(ip)}/json?token=${encodeURIComponent(IPINFO_TOKEN)}`;
-    const { ok, json } = await safeFetchJson(url, { headers: { Accept: "application/json" } });
+    const url = `https://ipinfo.io/${encodeURIComponent(
+      ip
+    )}/json?token=${encodeURIComponent(IPINFO_TOKEN)}`;
+
+    const { ok, json } = await safeFetchJson(url, {
+      headers: { Accept: "application/json" },
+    });
+
     if (ok) {
       const pin = json?.postal;
       if (isValidPin(pin)) return String(pin).trim();
     }
   }
 
-  // Fallback ipapi
-  {
-    const url = `https://ipapi.co/${encodeURIComponent(ip)}/json/`;
-    const { ok, json } = await safeFetchJson(url, { headers: { Accept: "application/json" } });
-    if (ok) {
-      const pin = json?.postal;
-      if (isValidPin(pin)) return String(pin).trim();
-    }
+  // Fallback: ipapi.co
+  const url = `https://ipapi.co/${encodeURIComponent(ip)}/json/`;
+
+  const { ok, json } = await safeFetchJson(url, {
+    headers: { Accept: "application/json" },
+  });
+
+  if (ok) {
+    const pin = json?.postal;
+    if (isValidPin(pin)) return String(pin).trim();
   }
 
   return null;
 }
 
+/* -----------------------------
+   Delhivery Expected TAT
+----------------------------- */
 async function getDelhiveryTatDays(destinationPin) {
   const url = new URL("https://track.delhivery.com/api/dc/expected_tat");
+
   url.searchParams.set("origin_pin", ORIGIN_PIN);
   url.searchParams.set("destination_pin", destinationPin);
   url.searchParams.set("mot", MOT);
@@ -121,39 +166,33 @@ async function getDelhiveryTatDays(destinationPin) {
   const tatNum = Number(tat);
 
   if (!tat || Number.isNaN(tatNum)) return null;
+
   return tatNum;
 }
 
+/* -----------------------------
+   Always Safe Fallback Response
+----------------------------- */
 function fail(res) {
-  // Always return safe fallback (no 500)
-  return res.json({ ok: false, message: "Please enter pincode." });
+  return res.json({
+    ok: false,
+    message: "Please enter pincode.",
+  });
 }
 
+/* -----------------------------
+   MAIN ENDPOINT: /edd
+----------------------------- */
 app.get("/edd", async (req, res) => {
   try {
-    // Manual pin override
+    /* Manual pin override */
     let destinationPin = (req.query.pin || "").toString().trim();
     let resolvedFrom = "query";
 
-    // Optional: debug mode (remove later)
-    const debug = req.query.debug === "1";
-
+    /* Auto detect pin from IP */
     if (!isValidPin(destinationPin)) {
-      const ip = normalizeIp(getClientIp(req));
-
-      if (debug) {
-        return res.json({
-          ok: false,
-          message: "debug",
-          headers: {
-            "x-shopify-client-ip": req.headers["x-shopify-client-ip"],
-            "x-forwarded-for": req.headers["x-forwarded-for"],
-            "cf-connecting-ip": req.headers["cf-connecting-ip"],
-          },
-          ip,
-          req_ip: req.ip,
-        });
-      }
+      const rawIp = getClientIp(req);
+      const ip = normalizeIp(rawIp);
 
       if (!ip || isPrivateIp(ip)) return fail(res);
 
@@ -164,11 +203,17 @@ app.get("/edd", async (req, res) => {
       resolvedFrom = "ip";
     }
 
+    /* Delhivery TAT */
     const tatDays = await getDelhiveryTatDays(destinationPin);
     if (!tatDays) return fail(res);
 
+    /* Delivery Date Calculation */
     const pickupDate = new Date();
-    if (pickupDate.getHours() >= 15) pickupDate.setDate(pickupDate.getDate() + 1);
+
+    // Cutoff: after 3 PM pickup next day
+    if (pickupDate.getHours() >= 15) {
+      pickupDate.setDate(pickupDate.getDate() + 1);
+    }
 
     const deliveryDate = new Date(pickupDate);
     deliveryDate.setDate(deliveryDate.getDate() + tatDays);
@@ -182,10 +227,27 @@ app.get("/edd", async (req, res) => {
       label: `Delivers by ${formatDate(deliveryDate)}`,
     });
   } catch (e) {
-    console.error("EDD error:", e);
+    console.error("EDD Error:", e);
     return fail(res);
   }
 });
 
+/* -----------------------------
+   OPTIONAL DEBUG ROUTE
+   Test: /ipdebug
+----------------------------- */
+app.get("/ipdebug", (req, res) => {
+  return res.json({
+    x_real_ip: req.headers["x-real-ip"],
+    x_forwarded_for: req.headers["x-forwarded-for"],
+    cf_connecting_ip: req.headers["cf-connecting-ip"],
+    detected_ip: getClientIp(req),
+    req_ip: req.ip,
+  });
+});
+
+/* -----------------------------
+   Start Server
+----------------------------- */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("EDD server running on", PORT));
