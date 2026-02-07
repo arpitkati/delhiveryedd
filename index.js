@@ -3,6 +3,9 @@ import fetch from "node-fetch";
 
 const app = express();
 
+/* -----------------------------
+   CORS
+----------------------------- */
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
@@ -10,15 +13,19 @@ app.use((req, res, next) => {
   next();
 });
 
-const ORIGIN_PIN = process.env.ORIGIN_PIN; // pickup pincode (6 digits)
+/* -----------------------------
+   ENV Variables
+----------------------------- */
+const ORIGIN_PIN = process.env.ORIGIN_PIN; // Pickup pincode (6 digits)
 const MOT = process.env.MOT || "E"; // E or S
 const DELHIVERY_TOKEN = process.env.DELHIVERY_TOKEN;
 
-const IPINFO_TOKEN = process.env.IPINFO_TOKEN; // recommended (ipinfo.io)
-
-// Render is behind proxies
+/* Render behind proxy */
 app.set("trust proxy", true);
 
+/* -----------------------------
+   Helpers
+----------------------------- */
 function formatDate(d) {
   return d.toLocaleDateString("en-IN", {
     weekday: "short",
@@ -31,18 +38,14 @@ function isValidPin(pin) {
   return /^\d{6}$/.test(String(pin || "").trim());
 }
 
-/**
- * Direct Render URL: best IP source is usually x-forwarded-for
- */
 function getClientIp(req) {
-  const xff = req.headers["x-forwarded-for"];
-  if (xff) return String(xff).split(",")[0].trim();
-
-  const realIp = req.headers["x-real-ip"];
-  if (realIp) return String(realIp).trim();
-
   const cf = req.headers["cf-connecting-ip"];
   if (cf) return String(cf).trim();
+
+  const xff = req.headers["x-forwarded-for"];
+  if (xff) {
+    return String(xff).split(",")[0].trim();
+  }
 
   return (req.ip || req.socket?.remoteAddress || "").toString().trim();
 }
@@ -58,6 +61,7 @@ function normalizeIp(ip) {
 function isPrivateIp(ip) {
   if (!ip) return true;
   const s = ip.trim();
+
   if (s === "127.0.0.1" || s === "::1") return true;
   if (s.startsWith("10.")) return true;
   if (s.startsWith("192.168.")) return true;
@@ -71,59 +75,37 @@ function isPrivateIp(ip) {
   return false;
 }
 
-/**
- * Safe JSON fetch: prevents crashes if upstream returns HTML/text
- */
+/* Safe JSON parse (prevents crashes if upstream returns HTML/text) */
 async function safeFetchJson(url, options = {}) {
   const r = await fetch(url, options);
   const text = await r.text();
   try {
-    return { ok: r.ok, status: r.status, json: JSON.parse(text) };
+    return { ok: r.ok, json: JSON.parse(text) };
   } catch {
-    return { ok: false, status: r.status, json: null };
+    return { ok: false, json: null };
   }
 }
 
-/**
- * IP -> PINCODE:
- * - Prefer ipinfo.io if token is set
- * - Fallback to ipapi.co
- */
+/* ✅ IP → PINCODE via KeyCDN */
 async function ipToPincode(ip) {
-  if (IPINFO_TOKEN) {
-    const url = `https://ipinfo.io/${encodeURIComponent(
-      ip
-    )}/json?token=${encodeURIComponent(IPINFO_TOKEN)}`;
+  const url = `https://tools.keycdn.com/geo.json?host=${encodeURIComponent(ip)}`;
 
-    const { ok, json } = await safeFetchJson(url, {
-      headers: { Accept: "application/json" },
-    });
+  const { ok, json } = await safeFetchJson(url, {
+    headers: {
+      Accept: "application/json",
+      "User-Agent": "keycdn-tools:https://google.com", // required
+    },
+  });
 
-    if (ok) {
-      const pin = json?.postal;
-      if (isValidPin(pin)) return String(pin).trim();
-    }
-  }
+  if (!ok || !json) return null;
 
-  // fallback
-  {
-    const url = `https://ipapi.co/${encodeURIComponent(ip)}/json/`;
-    const { ok, json } = await safeFetchJson(url, {
-      headers: { Accept: "application/json" },
-    });
+  // Your actual response: json.data.geo.postal_code
+  const pin = json?.data?.geo?.postal_code;
 
-    if (ok) {
-      const pin = json?.postal;
-      if (isValidPin(pin)) return String(pin).trim();
-    }
-  }
-
-  return null;
+  return isValidPin(pin) ? String(pin).trim() : null;
 }
 
-/**
- * Delhivery expected TAT in days
- */
+/* Delhivery expected TAT */
 async function getDelhiveryTatDays(destinationPin) {
   const url = new URL("https://track.delhivery.com/api/dc/expected_tat");
   url.searchParams.set("origin_pin", ORIGIN_PIN);
@@ -141,29 +123,28 @@ async function getDelhiveryTatDays(destinationPin) {
 
   const tat = json?.tat || json?.data?.tat || json?.response?.tat;
   const tatNum = Number(tat);
-  if (!tat || Number.isNaN(tatNum)) return null;
 
+  if (!tat || Number.isNaN(tatNum)) return null;
   return tatNum;
 }
 
 function fail(res) {
-  // Always safe fallback (no scary error)
   return res.json({ ok: false, message: "Please enter pincode." });
 }
 
-/**
- * GET /edd
- * - /edd?pin=411005 (manual)
- * - /edd (auto best-effort)
- */
+/* -----------------------------
+   GET /edd
+   - /edd?pin=411005 (manual)
+   - /edd (auto IP)
+----------------------------- */
 app.get("/edd", async (req, res) => {
   try {
     let destinationPin = (req.query.pin || "").toString().trim();
     let resolvedFrom = "query";
 
-    // Auto mode: detect pincode from IP
     if (!isValidPin(destinationPin)) {
       const ip = normalizeIp(getClientIp(req));
+
       if (!ip || isPrivateIp(ip)) return fail(res);
 
       const pinFromIp = await ipToPincode(ip);
@@ -173,11 +154,9 @@ app.get("/edd", async (req, res) => {
       resolvedFrom = "ip";
     }
 
-    // Call Delhivery
     const tatDays = await getDelhiveryTatDays(destinationPin);
     if (!tatDays) return fail(res);
 
-    // Compute delivery date (optional cutoff after 3pm)
     const pickupDate = new Date();
     if (pickupDate.getHours() >= 15) pickupDate.setDate(pickupDate.getDate() + 1);
 
