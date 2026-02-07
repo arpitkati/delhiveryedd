@@ -3,9 +3,6 @@ import fetch from "node-fetch";
 
 const app = express();
 
-/* -----------------------------
-   Basic CORS
------------------------------ */
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
@@ -13,23 +10,15 @@ app.use((req, res, next) => {
   next();
 });
 
-/* -----------------------------
-   ENV Variables
------------------------------ */
-const ORIGIN_PIN = process.env.ORIGIN_PIN; // Pickup pincode
+const ORIGIN_PIN = process.env.ORIGIN_PIN; // pickup pincode (6 digits)
 const MOT = process.env.MOT || "E"; // E or S
 const DELHIVERY_TOKEN = process.env.DELHIVERY_TOKEN;
 
-const IPINFO_TOKEN = process.env.IPINFO_TOKEN; // Recommended
+const IPINFO_TOKEN = process.env.IPINFO_TOKEN; // recommended (ipinfo.io)
 
-/* -----------------------------
-   IMPORTANT for Proxies
------------------------------ */
+// Render is behind proxies
 app.set("trust proxy", true);
 
-/* -----------------------------
-   Helpers
------------------------------ */
 function formatDate(d) {
   return d.toLocaleDateString("en-IN", {
     weekday: "short",
@@ -42,22 +31,15 @@ function isValidPin(pin) {
   return /^\d{6}$/.test(String(pin || "").trim());
 }
 
-/* -----------------------------
-   ✅ Correct Client IP Detection
-   Priority:
-   1) x-real-ip
-   2) x-forwarded-for (first IP)
-   3) cf-connecting-ip
-   4) Express fallback
------------------------------ */
+/**
+ * Direct Render URL: best IP source is usually x-forwarded-for
+ */
 function getClientIp(req) {
+  const xff = req.headers["x-forwarded-for"];
+  if (xff) return String(xff).split(",")[0].trim();
+
   const realIp = req.headers["x-real-ip"];
   if (realIp) return String(realIp).trim();
-
-  const xff = req.headers["x-forwarded-for"];
-  if (xff) {
-    return String(xff).split(",")[0].trim();
-  }
 
   const cf = req.headers["cf-connecting-ip"];
   if (cf) return String(cf).trim();
@@ -65,22 +47,17 @@ function getClientIp(req) {
   return (req.ip || req.socket?.remoteAddress || "").toString().trim();
 }
 
-/* Normalize IPv6-wrapped IPv4 */
 function normalizeIp(ip) {
   if (!ip) return "";
   let s = String(ip).trim();
-
   if (s.startsWith("::ffff:")) s = s.replace("::ffff:", "");
   if (s.includes("%")) s = s.split("%")[0];
-
   return s;
 }
 
-/* Private/local IP check */
 function isPrivateIp(ip) {
   if (!ip) return true;
   const s = ip.trim();
-
   if (s === "127.0.0.1" || s === "::1") return true;
   if (s.startsWith("10.")) return true;
   if (s.startsWith("192.168.")) return true;
@@ -94,25 +71,25 @@ function isPrivateIp(ip) {
   return false;
 }
 
-/* -----------------------------
-   Safe Fetch JSON (prevents crashes)
------------------------------ */
+/**
+ * Safe JSON fetch: prevents crashes if upstream returns HTML/text
+ */
 async function safeFetchJson(url, options = {}) {
   const r = await fetch(url, options);
   const text = await r.text();
-
   try {
-    return { ok: r.ok, json: JSON.parse(text) };
+    return { ok: r.ok, status: r.status, json: JSON.parse(text) };
   } catch {
-    return { ok: false, json: null };
+    return { ok: false, status: r.status, json: null };
   }
 }
 
-/* -----------------------------
-   IP → PINCODE Lookup
------------------------------ */
+/**
+ * IP -> PINCODE:
+ * - Prefer ipinfo.io if token is set
+ * - Fallback to ipapi.co
+ */
 async function ipToPincode(ip) {
-  // Best: ipinfo.io (token required)
   if (IPINFO_TOKEN) {
     const url = `https://ipinfo.io/${encodeURIComponent(
       ip
@@ -128,27 +105,27 @@ async function ipToPincode(ip) {
     }
   }
 
-  // Fallback: ipapi.co
-  const url = `https://ipapi.co/${encodeURIComponent(ip)}/json/`;
+  // fallback
+  {
+    const url = `https://ipapi.co/${encodeURIComponent(ip)}/json/`;
+    const { ok, json } = await safeFetchJson(url, {
+      headers: { Accept: "application/json" },
+    });
 
-  const { ok, json } = await safeFetchJson(url, {
-    headers: { Accept: "application/json" },
-  });
-
-  if (ok) {
-    const pin = json?.postal;
-    if (isValidPin(pin)) return String(pin).trim();
+    if (ok) {
+      const pin = json?.postal;
+      if (isValidPin(pin)) return String(pin).trim();
+    }
   }
 
   return null;
 }
 
-/* -----------------------------
-   Delhivery Expected TAT
------------------------------ */
+/**
+ * Delhivery expected TAT in days
+ */
 async function getDelhiveryTatDays(destinationPin) {
   const url = new URL("https://track.delhivery.com/api/dc/expected_tat");
-
   url.searchParams.set("origin_pin", ORIGIN_PIN);
   url.searchParams.set("destination_pin", destinationPin);
   url.searchParams.set("mot", MOT);
@@ -164,36 +141,29 @@ async function getDelhiveryTatDays(destinationPin) {
 
   const tat = json?.tat || json?.data?.tat || json?.response?.tat;
   const tatNum = Number(tat);
-
   if (!tat || Number.isNaN(tatNum)) return null;
 
   return tatNum;
 }
 
-/* -----------------------------
-   Always Safe Fallback Response
------------------------------ */
 function fail(res) {
-  return res.json({
-    ok: false,
-    message: "Please enter pincode.",
-  });
+  // Always safe fallback (no scary error)
+  return res.json({ ok: false, message: "Please enter pincode." });
 }
 
-/* -----------------------------
-   MAIN ENDPOINT: /edd
------------------------------ */
+/**
+ * GET /edd
+ * - /edd?pin=411005 (manual)
+ * - /edd (auto best-effort)
+ */
 app.get("/edd", async (req, res) => {
   try {
-    /* Manual pin override */
     let destinationPin = (req.query.pin || "").toString().trim();
     let resolvedFrom = "query";
 
-    /* Auto detect pin from IP */
+    // Auto mode: detect pincode from IP
     if (!isValidPin(destinationPin)) {
-      const rawIp = getClientIp(req);
-      const ip = normalizeIp(rawIp);
-
+      const ip = normalizeIp(getClientIp(req));
       if (!ip || isPrivateIp(ip)) return fail(res);
 
       const pinFromIp = await ipToPincode(ip);
@@ -203,17 +173,13 @@ app.get("/edd", async (req, res) => {
       resolvedFrom = "ip";
     }
 
-    /* Delhivery TAT */
+    // Call Delhivery
     const tatDays = await getDelhiveryTatDays(destinationPin);
     if (!tatDays) return fail(res);
 
-    /* Delivery Date Calculation */
+    // Compute delivery date (optional cutoff after 3pm)
     const pickupDate = new Date();
-
-    // Cutoff: after 3 PM pickup next day
-    if (pickupDate.getHours() >= 15) {
-      pickupDate.setDate(pickupDate.getDate() + 1);
-    }
+    if (pickupDate.getHours() >= 15) pickupDate.setDate(pickupDate.getDate() + 1);
 
     const deliveryDate = new Date(pickupDate);
     deliveryDate.setDate(deliveryDate.getDate() + tatDays);
@@ -227,27 +193,10 @@ app.get("/edd", async (req, res) => {
       label: `Delivers by ${formatDate(deliveryDate)}`,
     });
   } catch (e) {
-    console.error("EDD Error:", e);
+    console.error("EDD error:", e);
     return fail(res);
   }
 });
 
-/* -----------------------------
-   OPTIONAL DEBUG ROUTE
-   Test: /ipdebug
------------------------------ */
-app.get("/ipdebug", (req, res) => {
-  return res.json({
-    x_real_ip: req.headers["x-real-ip"],
-    x_forwarded_for: req.headers["x-forwarded-for"],
-    cf_connecting_ip: req.headers["cf-connecting-ip"],
-    detected_ip: getClientIp(req),
-    req_ip: req.ip,
-  });
-});
-
-/* -----------------------------
-   Start Server
------------------------------ */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("EDD server running on", PORT));
